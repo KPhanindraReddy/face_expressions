@@ -1,78 +1,71 @@
+# Install required packages
+!pip install openvino-dev[onnx]
+!pip install mediapipe
+
 import cv2
 import numpy as np
-from IPython.display import display, HTML, clear_output
-from google.colab.output import eval_js
-from base64 import b64decode, b64encode
 import time
-import mediapipe as mp
+from openvino.runtime import Core
+from IPython.display import display, HTML
+from base64 import b64decode, b64encode
+import os
 
-# Install MediaPipe if needed
-try:
-    import mediapipe
-except ImportError:
-    !pip install mediapipe
-    import mediapipe as mp
+# Download OpenVINO models
+if not os.path.exists('model'):
+    os.makedirs('model')
 
-# Initialize MediaPipe Face Mesh
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+!omz_downloader --name face-detection-adas-0001 --precisions FP32 -o model
+!omz_downloader --name facial-landmarks-35-adas-0002 --precisions FP32 -o model
+!omz_downloader --name emotions-recognition-retail-0003 --precisions FP32 -o model
 
-# Define facial expression analysis function
-def analyze_expression(face_landmarks, frame_shape):
-    """Analyze facial expression based on landmark positions"""
-    # Get key landmarks
-    landmarks = face_landmarks.landmark
-    
-    # Calculate mouth openness
-    mouth_upper = landmarks[13]
-    mouth_lower = landmarks[14]
-    mouth_openness = abs(mouth_upper.y - mouth_lower.y) * frame_shape[0]
-    
-    # Calculate eyebrow raise
-    left_eyebrow = landmarks[105]
-    right_eyebrow = landmarks[334]
-    eyebrow_raise = (left_eyebrow.y + right_eyebrow.y) * frame_shape[0] / 2
-    
-    # Calculate smile intensity
-    left_mouth_corner = landmarks[61]
-    right_mouth_corner = landmarks[291]
-    mouth_corners_distance = abs(left_mouth_corner.x - right_mouth_corner.x) * frame_shape[1]
-    
-    # Determine expression
-    expression = "Neutral"
-    
-    if mouth_openness > 15:
-        expression = "Surprised" if eyebrow_raise < 100 else "Yawning"
-    elif mouth_corners_distance > 50:
-        expression = "Smiling"
-    elif eyebrow_raise < 100:
-        expression = "Frowning"
-    
-    # Calculate expression intensity
-    intensity = min(1.0, max(0.0, 
-        (mouth_openness/20 + (150 - eyebrow_raise)/50 + mouth_corners_distance/60) / 3
-    ))
-    
-    return expression, intensity
+# Initialize OpenVINO core
+ie = Core()
 
-# Setup webcam with frame capture function
+# Load models
+print("Loading OpenVINO models...")
+face_model = ie.read_model(model='model/intel/face-detection-adas-0001/FP32/face-detection-adas-0001.xml')
+face_compiled_model = ie.compile_model(model=face_model, device_name="CPU")
+face_input_layer = face_compiled_model.input(0)
+_, _, H, W = face_input_layer.shape
+print(f"Face detection input shape: {H}x{W}")
+
+landmark_model = ie.read_model(model='model/intel/facial-landmarks-35-adas-0002/FP32/facial-landmarks-35-adas-0002.xml')
+landmark_compiled_model = ie.compile_model(model=landmark_model, device_name="CPU")
+landmark_input_layer = landmark_compiled_model.input(0)
+_, _, LANDMARK_H, LANDMARK_W = landmark_input_layer.shape
+print(f"Landmark model input shape: {LANDMARK_H}x{LANDMARK_W}")
+
+emotion_model = ie.read_model(model='model/intel/emotions-recognition-retail-0003/FP32/emotions-recognition-retail-0003.xml')
+emotion_compiled_model = ie.compile_model(model=emotion_model, device_name="CPU")
+emotion_input_layer = emotion_compiled_model.input(0)
+_, _, EMOTION_H, EMOTION_W = emotion_input_layer.shape
+print(f"Emotion model input shape: {EMOTION_H}x{EMOTION_W}")
+
+emotion_labels = ['neutral', 'happy', 'sad', 'surprise', 'anger']
+
+print("Models loaded successfully!")
+
+# Setup webcam with JavaScript
 display(HTML('''
-<video id="video" width="640" height="480" autoplay style="display:none;"></video>
-<canvas id="canvas" style="display:none;"></canvas>
-<button id="stopButton" style="padding:10px;font-size:16px;margin:10px;background:#4CAF50;color:white;border:none;border-radius:5px;">
-    Stop Monitoring
-</button>
-<div id="status" style="padding:10px;font-family:Arial;">Initializing camera...</div>
+<div style="display: flex; flex-direction: column; align-items: center;">
+    <div>
+        <video id="video" width="640" height="480" autoplay style="display:none;"></video>
+        <canvas id="canvas" style="display:none;"></canvas>
+        <img id="outputImage" width="640" height="480" style="border: 2px solid #4CAF50; border-radius: 5px;">
+    </div>
+    <div style="margin-top: 20px;">
+        <button id="stopButton" style="padding:10px;font-size:16px;margin:10px;background:#f44336;color:white;border:none;border-radius:5px;">
+            Stop Monitoring
+        </button>
+        <div id="status" style="padding:10px;font-family:Arial;font-size:16px;">Initializing camera...</div>
+    </div>
+</div>
 <script>
 // Create monitoring state on window object
 window.monitoringActive = true;
 const video = document.getElementById('video');
 const canvas = document.getElementById('canvas');
+const outputImage = document.getElementById('outputImage');
 const stopButton = document.getElementById('stopButton');
 const statusDiv = document.getElementById('status');
 
@@ -88,6 +81,11 @@ function captureFrame() {
     return canvas.toDataURL('image/jpeg', 0.8);
 }
 
+// Function to update output image
+function updateOutputImage(dataUrl) {
+    outputImage.src = dataUrl;
+}
+
 // Function to check monitoring state
 function isMonitoringActive() {
     return window.monitoringActive;
@@ -96,11 +94,11 @@ function isMonitoringActive() {
 // Camera setup
 async function setupCamera() {
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-            video: { width: 640, height: 480, facingMode: 'user' } 
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 640, height: 480, facingMode: 'user' }
         });
         video.srcObject = stream;
-        statusDiv.textContent = 'Camera ready. Starting monitoring...';
+        statusDiv.textContent = 'Camera ready. Monitoring active...';
         return true;
     } catch (err) {
         statusDiv.textContent = 'Camera error: ' + err.message;
@@ -117,6 +115,7 @@ stopButton.addEventListener('click', function() {
     statusDiv.textContent = 'Monitoring stopped.';
     stopButton.textContent = 'Stopped';
     stopButton.disabled = true;
+    stopButton.style.background = '#9e9e9e';
 });
 
 // Initialize camera
@@ -124,213 +123,199 @@ setupCamera();
 </script>
 '''))
 
-# Define state colors with requested changes:
-# - Looking away (left/right) is now red
-# - Looking down is now green (engaged)
+# Define state colors
 state_colors = {
-    'looking_forward': (0, 255, 0),      # Green - Engaged
-    'looking_away': (0, 0, 255),          # Red - Disengaged (looking left/right)
-    'face_not_visible': (128, 128, 128)   # Gray - Unknown
+    'engaged': (0, 255, 0),          # Green - Engaged
+    'disengaged': (0, 0, 255),        # Red - Disengaged
+    'looking_down': (255, 255, 0),    # Yellow - Looking down
+    'unknown': (128, 128, 128)        # Gray - Unknown
 }
 
-print("Starting student engagement monitoring...")
+print("Starting student engagement monitoring with OpenVINO...")
 print("Click 'Stop' button to exit")
 
 def get_frame():
     """Capture frame using predefined JavaScript function"""
     return eval_js("captureFrame()")
 
-def detect_faces(frame):
-    """Detect faces using Haar cascade"""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    return face_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(100, 100)
-    )
+def update_output(data_url):
+    """Update output image in browser"""
+    display(HTML(f"<script>updateOutputImage('{data_url}');</script>"))
 
-def detect_eyes(face_roi):
-    """Detect eyes within face region"""
-    gray = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-    return eye_cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(30, 30)
-    )
+# ----------------------------
+# Face Detection with OpenVINO
+# ----------------------------
+def detect_faces_ov(frame):
+    # Preprocess input image
+    resized = cv2.resize(frame, (W, H))
+    input_image = np.expand_dims(resized.transpose(2, 0, 1), axis=0)
+    
+    # Inference
+    results = face_compiled_model([input_image])[face_compiled_model.output(0)]
+    faces = []
+    
+    # Process results
+    for detection in results[0][0]:
+        confidence = detection[2]
+        if confidence > 0.3:  # Lower confidence threshold
+            x_min = int(detection[3] * frame.shape[1])
+            y_min = int(detection[4] * frame.shape[0])
+            x_max = int(detection[5] * frame.shape[1])
+            y_max = int(detection[6] * frame.shape[0])
+            w = x_max - x_min
+            h = y_max - y_min
+            # Filter out small detections
+            if w > 30 and h > 30:  # More lenient size filter
+                faces.append((x_min, y_min, w, h))
+    
+    return faces
 
-def determine_state(face_position, eyes, frame_width):
-    """Determine student's attention state with requested changes"""
+# ----------------------------
+# Facial Landmarks with OpenVINO
+# ----------------------------
+def detect_landmarks_ov(face_roi):
+    # Preprocess input image with CORRECT dimensions
+    resized = cv2.resize(face_roi, (LANDMARK_W, LANDMARK_H))
+    input_image = np.expand_dims(resized.transpose(2, 0, 1), axis=0).astype(np.float32)
+    
+    # Inference
+    landmarks = landmark_compiled_model([input_image])[landmark_compiled_model.output(0)]
+    return landmarks[0].reshape(-1, 2)
+
+# ----------------------------
+# Emotion Recognition with OpenVINO
+# ----------------------------
+def detect_emotion_ov(face_roi):
+    # Preprocess input image with CORRECT dimensions
+    resized = cv2.resize(face_roi, (EMOTION_W, EMOTION_H))
+    input_image = np.expand_dims(resized.transpose(2, 0, 1), axis=0).astype(np.float32)
+    
+    # Inference
+    emotions = emotion_compiled_model([input_image])[emotion_compiled_model.output(0)]
+    emotion_idx = np.argmax(emotions)
+    confidence = emotions[0][emotion_idx]
+    
+    return emotion_labels[emotion_idx], confidence
+
+# ----------------------------
+# Attention State Detection (Simplified)
+# ----------------------------
+def determine_state(face_position, frame_width):
     x, y, w, h = face_position
     
-    # No eyes detected = looking down, now considered engaged (green)
-    if len(eyes) == 0:
-        return 'looking_forward'
-    
-    # Calculate horizontal position
+    # Calculate face center
     face_center_x = x + w//2
     frame_center_x = frame_width // 2
     position_ratio = (face_center_x - frame_center_x) / frame_center_x
+
+    # Simple attention detection
+    if abs(position_ratio) > 0.3:
+        return 'disengaged'
     
-    # Determine direction based on position
-    if position_ratio < -0.3 or position_ratio > 0.3: 
-        return 'looking_away'  # Looking left/right is now disengaged (red)
-    
-    return 'looking_forward'  # Centered is engaged (green)
+    return 'engaged'
 
 # Initialize tracking
-state_counts = {state: 0 for state in state_colors}
-expression_counts = {
-    'Neutral': 0,
-    'Smiling': 0,
-    'Surprised': 0,
-    'Frowning': 0,
-    'Yawning': 0,
-    'Other': 0
-}
-engagement_weights = {
-    'looking_forward': 1.0,     # Engaged (green)
-    'looking_away': 0.4,        # Disengaged (red)
-    'face_not_visible': 0.5     # Unknown (gray)
-}
 frame_count = 0
-engagement_scores = []
+start_time = time.time()
+student_counts = []
+emotion_counts = {e: 0 for e in emotion_labels}
+state_counts = {s: 0 for s in state_colors}
 
 try:
     print("Initializing camera...")
     time.sleep(3)  # Allow camera initialization
-    
+
     while frame_count < 300:  # Process up to 300 frames
         frame_count += 1
-        
-        # Check if monitoring should stop using JS function
+
+        # Check if monitoring should stop
         if not eval_js('isMonitoringActive()'):
             print("Monitoring stopped by user")
             break
-            
+
         # Get frame from JS
         js_reply = get_frame()
         if not js_reply or ',' not in js_reply:
             continue
-            
+
         # Decode image
         _, data = js_reply.split(',', 1)
         nparr = np.frombuffer(b64decode(data), np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
+
         if frame is None or frame.size == 0:
             continue
-        
+
         # Mirror and process frame
         frame = cv2.flip(frame, 1)
         annotated_frame = frame.copy()
-        frame_width = frame.shape[1]
         height, width = frame.shape[:2]
         
-        # Detect faces and eyes
-        faces = detect_faces(frame)
-        current_states = []
-        current_expression = "None"
-        expression_intensity = 0
+        # Detect faces with OpenVINO
+        faces = detect_faces_ov(frame)
+        student_count = len(faces)
+        student_counts.append(student_count)
         
-        # Process each detected face
-        if faces is not None and len(faces) > 0:
-            for (x, y, w, h) in faces:
-                face_roi = frame[y:y+h, x:x+w]
-                if face_roi.size == 0:
-                    continue
-                    
-                eyes = detect_eyes(face_roi)
-                state = determine_state((x, y, w, h), eyes, frame_width)
-                current_states.append(state)
-                state_counts[state] += 1
-                
-                # Analyze facial expression using MediaPipe
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = face_mesh.process(rgb_frame)
-                
-                if results.multi_face_landmarks:
-                    for face_landmarks in results.multi_face_landmarks:
-                        # Analyze expression
-                        expression, intensity = analyze_expression(face_landmarks, frame.shape)
-                        current_expression = expression
-                        expression_intensity = intensity
-                        expression_counts[expression] += 1
-                        
-                        # Draw facial landmarks
-                        for landmark in face_landmarks.landmark:
-                            cx, cy = int(landmark.x * width), int(landmark.y * height)
-                            cv2.circle(annotated_frame, (cx, cy), 1, (0, 255, 255), -1)
-                
-                # Annotate face
-                color = state_colors[state]
-                cv2.rectangle(annotated_frame, (x, y), (x+w, y+h), color, 2)
-                
-                # Use appropriate label based on state
-                if state == 'looking_away':
-                    label = "Looking Away"
-                elif state == 'looking_forward':
-                    # Distinguish between engaged and looking down
-                    label = "Engaged" if len(eyes) > 0 else "Looking Down (Engaged)"
-                else:
-                    label = state.replace('_', ' ').title()
-                    
-                # Add expression label if detected
-                text_y = y - 10
-                cv2.putText(annotated_frame, label, 
-                            (x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                
-                if current_expression != "None":
-                    text_y -= 30
-                    expression_text = f"Expression: {current_expression} ({expression_intensity:.1f})"
-                    cv2.putText(annotated_frame, expression_text, 
-                                (x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-                
-                # Annotate eyes
-                for (ex, ey, ew, eh) in eyes:
-                    cv2.rectangle(annotated_frame, (x+ex, y+ey), (x+ex+ew, y+ey+eh), (0, 255, 0), 1)
-        else:
-            state = 'face_not_visible'
-            current_states.append(state)
-            state_counts[state] += 1
-        
-        # Calculate engagement with expression bonus
-        if current_states:
-            base_score = np.mean([engagement_weights[s] for s in current_states])
+        # Process each face
+        for (x, y, w, h) in faces:
+            # Get face ROI
+            face_roi = frame[y:y+h, x:x+w]
+            if face_roi.size == 0:
+                continue
             
-            # Add bonus for positive expressions
-            expression_bonus = 0
-            if current_expression == "Smiling":
-                expression_bonus = 0.2 * expression_intensity
-            elif current_expression == "Surprised":
-                expression_bonus = 0.1 * expression_intensity
-            
-            avg_score = min(1.0, base_score + expression_bonus)
-            engagement_scores.append(avg_score)
-        else:
-            avg_score = 0.0
+            try:
+                # Detect emotion
+                emotion, confidence = detect_emotion_ov(face_roi)
+                emotion_counts[emotion] += 1
+                
+                # Determine attention state
+                state = determine_state((x, y, w, h), width)
+                state_counts[state] = state_counts.get(state, 0) + 1
+                
+                # Draw face bounding box
+                color = state_colors.get(state, (128, 128, 128))
+                cv2.rectangle(annotated_frame, (x, y), (x+w, y+h), color, 3)  # Thicker border
+                
+                # Add labels
+                label = f"{state.capitalize()} | {emotion.capitalize()}"
+                text_y = y - 10 if y > 30 else y + 30
+                cv2.putText(annotated_frame, label, (x, text_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)  # Larger font
+                
+                # Add confidence indicator
+                cv2.putText(annotated_frame, f"{confidence*100:.1f}%", 
+                           (x, text_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
+                
+            except Exception as e:
+                # Skip this face but continue processing
+                continue
         
-        # Add metrics to frame
-        cv2.putText(annotated_frame, f"Engagement: {avg_score:.2f}", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(annotated_frame, f"Frame: {frame_count}/300", 
-                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(annotated_frame, "Press 'Stop' to end monitoring", 
-                   (width - 300, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # Add metrics
+        elapsed_time = time.time() - start_time
+        fps = frame_count / elapsed_time if elapsed_time > 0 else 0
+        cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, f"Students: {student_count}", (10, 70), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, f"Frame: {frame_count}/300", (10, 110), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        
+        # Add status indicator
+        status_text = "Monitoring Active" if eval_js('isMonitoringActive()') else "Monitoring Stopped"
+        status_color = (0, 255, 0) if eval_js('isMonitoringActive()') else (0, 0, 255)
+        cv2.putText(annotated_frame, status_text, (width - 250, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
         
         # Display results
-        clear_output(wait=True)
         _, buffer = cv2.imencode('.jpg', annotated_frame)
-        display(HTML(f'<img src="data:image/jpeg;base64,{b64encode(buffer).decode()}" />'))
-        
-        # Print frame summary
-        summary = f"Frame {frame_count}: Engagement: {avg_score:.2f}"
-        if current_expression != "None":
-            summary += f", Expression: {current_expression} ({expression_intensity:.1f})"
-        print(summary)
-        
-        time.sleep(0.1)
+        data_url = f"data:image/jpeg;base64,{b64encode(buffer).decode()}"
+        update_output(data_url)
+
+        # Print periodic summary
+        if frame_count % 10 == 0:  # Print every 10 frames
+            print(f"Frame {frame_count}: Faces: {student_count}")
+
+        time.sleep(0.01)
 
 except Exception as e:
     print(f"Error: {str(e)}")
@@ -338,38 +323,32 @@ except Exception as e:
     print(traceback.format_exc())
 
 # Final report
-if engagement_scores:
-    avg_engagement = np.mean(engagement_scores)
+if frame_count > 0:
+    avg_students = np.mean(student_counts) if student_counts else 0
+    elapsed_time = time.time() - start_time
+    
     print("\n" + "="*50)
-    print("Engagement Report Summary")
+    print("CLASSROOM MONITORING REPORT")
     print("="*50)
+    print(f"Monitoring duration: {elapsed_time:.1f} seconds")
     print(f"Total frames processed: {frame_count}")
-    print(f"Average engagement: {avg_engagement:.2f}/1.0")
-    
-    print("\nAttention States:")
+    print(f"Average FPS: {frame_count/elapsed_time:.1f if elapsed_time > 0 else 0}")
+    print(f"Average students detected: {avg_students:.1f}")
+
+    print("\nATTENTION STATES DISTRIBUTION:")
+    total_states = sum(state_counts.values())
     for state, count in state_counts.items():
-        percentage = count / frame_count * 100
-        state_label = {
-            'looking_forward': 'Engaged (Looking Forward/Down)',
-            'looking_away': 'Disengaged (Looking Away)',
-            'face_not_visible': 'Face Not Visible'
-        }[state]
-        print(f"- {state_label}: {count} frames ({percentage:.1f}%)")
-    
-    print("\nFacial Expression Distribution:")
-    total_expression_frames = sum(expression_counts.values())
-    if total_expression_frames > 0:
-        for expression, count in expression_counts.items():
-            percentage = count / total_expression_frames * 100
-            print(f"- {expression}: {count} frames ({percentage:.1f}%)")
-    else:
-        print("- No expressions detected in any frames")
-    
-    # Calculate expression diversity
-    detected_expressions = sum(1 for count in expression_counts.values() if count > 0)
-    diversity_score = detected_expressions / len(expression_counts) * 100
-    print(f"\nExpression Diversity: {diversity_score:.1f}%")
-    
+        percentage = (count / total_states) * 100 if total_states > 0 else 0
+        print(f"- {state.upper()}: {count} frames ({percentage:.1f}%)")
+
+    print("\nEMOTION DISTRIBUTION:")
+    total_emotions = sum(emotion_counts.values())
+    for emotion, count in emotion_counts.items():
+        percentage = (count / total_emotions) * 100 if total_emotions > 0 else 0
+        print(f"- {emotion.upper()}: {count} frames ({percentage:.1f}%)")
+
+    print("\n" + "="*50)
+    print("MONITORING COMPLETE")
     print("="*50)
 else:
-    print("No frames processed. Check camera connection.")
+    print("No frames processed. Please check camera access and try again.")
